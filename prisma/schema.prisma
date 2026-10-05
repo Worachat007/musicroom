@@ -1,0 +1,179 @@
+// Prisma Schema for Music Practice Room & Equipment Borrowing System
+// Datasource: PostgreSQL
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  ADMIN   // ผู้ดูแลห้องซ้อม / เจ้าหน้าที่ชมรม
+  MEMBER  // สมาชิกชมรมดนตรี
+}
+
+enum RoomStatus {
+  AVAILABLE    // พร้อมใช้งาน
+  MAINTENANCE  // ปิดปรับปรุง / ซ่อมบำรุง
+  CLOSED       // ปิดบริการชั่วคราว
+}
+
+enum BookingStatus {
+  PENDING    // รออนุมัติจากผู้ดูแล
+  APPROVED   // อนุมัติแล้ว
+  REJECTED   // ไม่อนุมัติ
+  IN_USE     // กำลังเข้าใช้งาน
+  COMPLETED  // ใช้งานเสร็จสิ้นตามเวลา
+  CANCELLED  // สมาชิกยกเลิก
+}
+
+enum EquipmentCategory {
+  GUITAR       // กีตาร์ไฟฟ้า / กีตาร์โปร่ง
+  BASS         // เบสไฟฟ้า
+  DRUMS        // กลองชุด / ฉาบ / แป้นซ้อม
+  KEYBOARD     // เปียโนไฟฟ้า / ซินธิไซเซอร์
+  AMPLIFIER    // แอมป์กีตาร์ / แอมป์เบส / ตู้มอนิเตอร์
+  MICROPHONE   // ไมโครโฟนร้อง / ไมโครโฟนเครื่องดนตรี
+  ACCESSORIES  // สายสัญญาณ / ขาตั้ง / กล่องเอฟเฟกต์
+}
+
+enum EquipmentCondition {
+  EXCELLENT  // สภาพดีเยี่ยม 100%
+  GOOD       // สภาพดี พร้อมใช้งาน
+  FAIR       // มีรอยการใช้งาน แต่ใช้งานได้ปกติ
+  MAINTENANCE // ชำรุด/ส่งซ่อม
+}
+
+enum BorrowStatus {
+  REQUESTED  // ยื่นคำขอยืม (รออนุมัติ)
+  BORROWED   // อนุมัติและรับอุปกรณ์ไปแล้ว (กำลังยืม)
+  RETURNED   // นำอุปกรณ์มาส่งคืนและตรวจสอบแล้ว
+  OVERDUE    // เกินกำหนดเวลาส่งคืน
+  REJECTED   // ปฏิเสธคำขอยืม
+}
+
+model User {
+  id          String      @id @default(uuid())
+  email       String      @unique
+  name        String
+  studentId   String      @unique
+  phone       String
+  role        Role        @default(MEMBER)
+  faculty     String
+  bandName    String?
+  avatar      String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  bookings    Booking[]
+  borrowings  Borrowing[]
+  logs        AuditLog[]
+
+  @@map("users")
+}
+
+model Room {
+  id                String       @id @default(uuid())
+  code              String       @unique // เช่น RM-01, RM-02
+  name              String       // เช่น Studio A (Main Hall)
+  capacity          Int          // ความจุคน
+  description       String?
+  equipmentIncluded String[]     // รายการเครื่องดนตรีประจำห้อง
+  hourlyRate        Decimal      @default(0.0) @db.Decimal(10, 2)
+  status            RoomStatus   @default(AVAILABLE)
+  imageUrl          String?
+  color             String?      // Theme color code
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  bookings          Booking[]
+
+  @@map("rooms")
+}
+
+model Booking {
+  id           String        @id @default(uuid())
+  bookingCode  String        @unique // เช่น BK-20261005-001
+  userId       String
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roomId       String
+  room         Room          @relation(fields: [roomId], references: [id], onDelete: Restrict)
+  date         DateTime      @db.Date
+  startTime    String        // เช่น "13:00"
+  endTime      String        // เช่น "15:00"
+  purpose      String        // วัตถุประสงค์ (เช่น ซ้อมงาน Open House, บันทึกเดโม่)
+  bandName     String        // ชื่อวงดนตรี
+  memberCount  Int           @default(1)
+  status       BookingStatus @default(PENDING)
+  adminNote    String?       // เหตุผลหรือบันทึกจากผู้ดูแล
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([date, roomId])
+  @@index([userId])
+  @@map("bookings")
+}
+
+model Equipment {
+  id                String             @id @default(uuid())
+  code              String             @unique // เช่น EQ-GTR-001
+  name              String
+  category          EquipmentCategory
+  brand             String
+  model             String
+  totalQuantity     Int                @default(1)
+  availableQuantity Int                @default(1)
+  condition         EquipmentCondition @default(GOOD)
+  location          String             // ตำแหน่งตู้เก็บ เช่น ตู้ A1, ชั้นวาง C
+  description       String?
+  imageUrl          String?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  borrowings        Borrowing[]
+
+  @@map("equipments")
+}
+
+model Borrowing {
+  id                 String             @id @default(uuid())
+  borrowCode         String             @unique // เช่น BR-202610-001
+  userId             String
+  user               User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  equipmentId        String
+  equipment          Equipment          @relation(fields: [equipmentId], references: [id], onDelete: Restrict)
+  quantity           Int                @default(1)
+  borrowDate         DateTime           @db.Date
+  expectedReturnDate DateTime           @db.Date
+  actualReturnDate   DateTime?          @db.Date
+  purpose            String             // กิจกรรมที่นำไปใช้
+  status             BorrowStatus       @default(REQUESTED)
+  borrowCondition    EquipmentCondition @default(GOOD)
+  returnCondition    EquipmentCondition?
+  adminNote          String?
+  approvedBy         String?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  @@index([userId])
+  @@index([equipmentId])
+  @@index([status])
+  @@map("borrowings")
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  action      String   // CREATE, UPDATE, DELETE, APPROVE, REJECT
+  entity      String   // BOOKING, BORROWING, ROOM, EQUIPMENT
+  entityId    String
+  actorId     String
+  actor       User     @relation(fields: [actorId], references: [id], onDelete: Cascade)
+  details     Json?
+  timestamp   DateTime @default(now())
+
+  @@index([timestamp])
+  @@map("audit_logs")
+}

@@ -1,0 +1,6 @@
+{
+  "name": "ระบบบันทึกการใช้บริการห้องซ้อมดนตรี & ยืมอุปกรณ์",
+  "description": "ระบบบันทึกข้อมูลการใช้บริการห้องซ้อมดนตรี และการยืม-คืนอุปกรณ์ดนตรี พร้อม CRUD, Validation, สิทธิ์ผู้ดูแลและสมาชิกชมรม, Search/Filter และ RESTful API",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
