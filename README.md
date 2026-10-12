@@ -16,10 +16,11 @@
 ต้องใช้ Node.js ที่รองรับ Vite 8 และ PostgreSQL
 
 1. ติดตั้ง dependencies: `npm install`
-2. ตั้ง `DATABASE_URL` ใน `.env` ให้ชี้ไป PostgreSQL และตั้ง `SESSION_SECRET` เป็น secret แบบสุ่มยาว
-3. สร้างตาราง: `npm run db:push`
-4. เพิ่มห้องเริ่มต้น: `npm run db:seed`
-5. เริ่มเว็บและ API: `npm run dev`
+2. สร้างไฟล์ environment จากตัวอย่างใน PowerShell: `Copy-Item .env.example .env`
+3. แก้ `.env` โดยใส่ PostgreSQL connection string จริงใน `DATABASE_URL` และกำหนด `SESSION_SECRET` เป็น secret แบบสุ่มยาว (`.env` ถูก ignore โดย Git)
+4. สร้างตาราง: `npm run db:push`
+5. เพิ่มห้องเริ่มต้น: `npm run db:seed`
+6. เริ่มเว็บและ API: `npm run dev`
 
 หากต้องการบัญชีผู้ดูแล ให้กำหนด `ADMIN_STUDENT_ID`, `ADMIN_PASSWORD` (อย่างน้อย 8 ตัวอักษร) และ `ADMIN_NAME` ก่อนรัน seed คำสั่ง seed จะไม่สร้างบัญชีตัวอย่างหรือเปิดทางสลับสิทธิ์จากหน้าเว็บ
 
