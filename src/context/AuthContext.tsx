@@ -1,83 +1,46 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import { User, UserRole } from '../types/index.ts';
+import React, { createContext, useContext, useEffect, useState } from 'react';
+import type { User } from '../types/index.ts';
 import { api } from '../lib/api.ts';
 
 interface AuthContextType {
   currentUser: User | null;
-  allUsers: User[];
   isLoading: boolean;
   isAdmin: boolean;
-  isMember: boolean;
-  switchUser: (userId: string) => void;
-  switchRole: (role: UserRole) => void;
-  refreshUsers: () => Promise<void>;
+  login: (studentId: string, password: string) => Promise<void>;
+  register: (name: string, studentId: string, password: string) => Promise<void>;
+  logout: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [allUsers, setAllUsers] = useState<User[]>([]);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-
-  const fetchUsers = async () => {
-    try {
-      setIsLoading(true);
-      const res = await api.getUsers();
-      setAllUsers(res.data);
-
-      const savedId = localStorage.getItem('music_club_user_id');
-      const found = res.data.find(u => u.id === savedId);
-      if (found) {
-        setCurrentUser(found);
-      } else if (res.data.length > 0) {
-        // Default to admin or first user
-        setCurrentUser(res.data[0]);
-        localStorage.setItem('music_club_user_id', res.data[0].id);
-      }
-    } catch (err) {
-      console.error('Failed to load users:', err);
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    fetchUsers();
+    api.getCurrentUser()
+      .then((result) => setCurrentUser(result.data))
+      .catch(() => setCurrentUser(null))
+      .finally(() => setIsLoading(false));
   }, []);
 
-  const switchUser = (userId: string) => {
-    const user = allUsers.find(u => u.id === userId);
-    if (user) {
-      setCurrentUser(user);
-      localStorage.setItem('music_club_user_id', user.id);
-    }
+  const login = async (studentId: string, password: string) => {
+    const result = await api.login({ studentId, password });
+    setCurrentUser(result.data);
   };
 
-  const switchRole = (role: UserRole) => {
-    const user = allUsers.find(u => u.role === role);
-    if (user) {
-      setCurrentUser(user);
-      localStorage.setItem('music_club_user_id', user.id);
-    }
+  const register = async (name: string, studentId: string, password: string) => {
+    const result = await api.register({ name, studentId, password });
+    setCurrentUser(result.data);
   };
 
-  const isAdmin = currentUser?.role === 'ADMIN';
-  const isMember = currentUser?.role === 'MEMBER';
+  const logout = async () => {
+    await api.logout();
+    setCurrentUser(null);
+  };
 
   return (
-    <AuthContext.Provider
-      value={{
-        currentUser,
-        allUsers,
-        isLoading,
-        isAdmin,
-        isMember,
-        switchUser,
-        switchRole,
-        refreshUsers: fetchUsers,
-      }}
-    >
+    <AuthContext.Provider value={{ currentUser, isLoading, isAdmin: currentUser?.role === 'ADMIN', login, register, logout }}>
       {children}
     </AuthContext.Provider>
   );
@@ -85,8 +48,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
 export const useAuth = () => {
   const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error('useAuth must be used within an AuthProvider');
-  }
+  if (!context) throw new Error('useAuth must be used within AuthProvider');
   return context;
 };

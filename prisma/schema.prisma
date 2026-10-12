@@ -57,12 +57,13 @@ enum BorrowStatus {
 
 model User {
   id          String      @id @default(uuid())
-  email       String      @unique
+  email       String?     @unique
   name        String
   studentId   String      @unique
-  phone       String
+  passwordHash String
+  phone       String      @default("")
   role        Role        @default(MEMBER)
-  faculty     String
+  faculty     String      @default("")
   bandName    String?
   avatar      String?
   createdAt   DateTime    @default(now())
@@ -106,6 +107,7 @@ model Booking {
   endTime      String        // เช่น "15:00"
   purpose      String        // วัตถุประสงค์ (เช่น ซ้อมงาน Open House, บันทึกเดโม่)
   bandName     String        // ชื่อวงดนตรี
+  phone        String        @default("")
   memberCount  Int           @default(1)
   status       BookingStatus @default(PENDING)
   adminNote    String?       // เหตุผลหรือบันทึกจากผู้ดูแล

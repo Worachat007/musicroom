@@ -4,10 +4,10 @@ export interface User {
   id: string;
   name: string;
   studentId: string;
-  email: string;
+  email?: string | null;
   phone: string;
   role: UserRole;
-  faculty: string;
+  faculty?: string;
   bandName?: string;
   avatar?: string;
 }
@@ -58,6 +58,7 @@ export interface Booking {
 
 export interface RoomAvailability {
   roomId: string;
+  date?: string;
   startTime: string;
   endTime: string;
   status: BookingStatus;

@@ -1,360 +1,257 @@
-import { Router, Request, Response, RequestHandler } from 'express';
-import { dbStore } from './db.ts';
+import { Router, type Request, type RequestHandler, type Response } from 'express';
+import { randomUUID } from 'node:crypto';
+import { Prisma, type BookingStatus } from '@prisma/client';
+import { clearSessionCookie, getSessionUserId, hashPassword, setSessionCookie, verifyPassword } from './auth.ts';
+import { listBookings, listRooms, mapBooking, mapRoom, prisma } from './db.ts';
 
 export const apiRouter = Router();
 
-// Middleware to simulate current authenticated user from header
-const getActor = (req: Request) => {
-  const actorHeader = req.headers['x-user-id'] as string;
-  if (actorHeader) {
-    return dbStore.getUserById(actorHeader);
+type SafeUser = { id: string; name: string; studentId: string; role: 'ADMIN' | 'MEMBER'; phone: string; bandName: string | null };
+type AuthedRequest = Request & { actor: SafeUser };
+
+class ApiError extends Error {
+  constructor(public status: number, message: string) { super(message); }
+}
+
+function sendError(response: Response, error: unknown) {
+  if (error instanceof ApiError) return response.status(error.status).json({ success: false, error: error.message });
+  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+    return response.status(409).json({ success: false, error: 'รหัสนักศึกษานี้สมัครสมาชิกแล้ว' });
   }
-  return undefined;
-};
-
-const requireAdmin: RequestHandler = (req, res, next) => {
-  const actor = getActor(req);
-  if (!actor) return res.status(401).json({ success: false, error: 'กรุณาเข้าสู่ระบบ' });
-  if (actor.role !== 'ADMIN') return res.status(403).json({ success: false, error: 'ต้องใช้สิทธิ์ผู้ดูแลระบบ' });
-  next();
-};
-
-apiRouter.use((req, res, next) => {
-  if (!getActor(req)) return res.status(401).json({ success: false, error: 'ไม่พบผู้ใช้หรือกรุณาเข้าสู่ระบบใหม่' });
-  next();
-});
-
-// --- AUTH & USERS ---
-apiRouter.get('/users', (req: Request, res: Response) => {
-  const actor = getActor(req)!;
-  res.json({ success: true, data: actor.role === 'ADMIN' ? dbStore.getUsers() : [actor] });
-});
-
-apiRouter.post('/auth/login', requireAdmin, (req: Request, res: Response) => {
-  const { userId, role } = req.body;
-  const users = dbStore.getUsers();
-  let user = users.find(u => u.id === userId);
-  if (!user && role) {
-    user = users.find(u => u.role === role);
+  const errorMessage = error instanceof Error ? error.message : '';
+  if (errorMessage.includes('Environment variable not found: DATABASE_URL')) {
+    return response.status(503).json({ success: false, error: 'ระบบยังไม่ได้เชื่อมต่อฐานข้อมูล กรุณาแจ้งผู้ดูแลระบบตั้งค่า DATABASE_URL ก่อนสมัครสมาชิก' });
   }
-  if (!user) {
-    return res.status(404).json({ success: false, error: 'ไม่พบผู้ใช้งานนี้ในระบบ' });
+  if (errorMessage.includes('SESSION_SECRET is required in production')) {
+    return response.status(503).json({ success: false, error: 'ระบบสมาชิกยังตั้งค่าไม่ครบ กรุณาแจ้งผู้ดูแลระบบตรวจสอบ SESSION_SECRET' });
   }
-  return res.json({ success: true, data: user });
-});
+  console.error('API error:', error);
+  return response.status(500).json({ success: false, error: 'ระบบขัดข้องชั่วคราว กรุณาลองใหม่ หากยังไม่สำเร็จโปรดแจ้งผู้ดูแลระบบ' });
+}
 
-// --- STATS & LOGS ---
-apiRouter.get('/stats', (req: Request, res: Response) => {
-  const stats = dbStore.getStats();
-  if (getActor(req)!.role !== 'ADMIN') {
-    stats.pendingBookings = 0;
-    stats.pendingBorrowings = 0;
-    stats.overdueBorrowings = 0;
-  }
-  res.json({ success: true, data: stats });
-});
+function safeUser(user: { id: string; name: string; studentId: string; role: 'ADMIN' | 'MEMBER'; phone: string; bandName: string | null }): SafeUser {
+  return { id: user.id, name: user.name, studentId: user.studentId, role: user.role, phone: user.phone, bandName: user.bandName };
+}
 
-apiRouter.get('/logs', (req: Request, res: Response) => {
-  if (getActor(req)!.role !== 'ADMIN') return res.json({ success: true, data: [] });
-  res.json({ success: true, data: dbStore.getLogs() });
-});
-
-apiRouter.post('/seed/reset', requireAdmin, (req: Request, res: Response) => {
-  dbStore.resetData();
-  res.json({ success: true, message: 'รีเซ็ตข้อมูลระบบกลับสู่ค่าเริ่มต้นเรียบร้อย' });
-});
-
-// --- ROOMS (CRUD: GET, POST, PUT, DELETE) ---
-apiRouter.get('/rooms', (req: Request, res: Response) => {
-  const { search, status } = req.query as { search?: string; status?: string };
-  const rooms = dbStore.getRooms(search, status);
-  res.json({ success: true, count: rooms.length, data: rooms });
-});
-
-apiRouter.get('/rooms/:id', (req: Request, res: Response) => {
-  const room = dbStore.getRoomById(req.params.id);
-  if (!room) return res.status(404).json({ success: false, error: 'ไม่พบห้องซ้อมนี้' });
-  res.json({ success: true, data: room });
-});
-
-apiRouter.get('/availability', (req: Request, res: Response) => {
-  const date = String(req.query.date || '');
-  if (!date) return res.status(400).json({ success: false, error: 'กรุณาระบุวันที่ต้องการตรวจสอบ' });
-  const data = dbStore.getBookings({ date })
-    .filter((booking) => ['PENDING', 'APPROVED', 'IN_USE'].includes(booking.status))
-    .map(({ roomId, startTime, endTime, status }) => ({ roomId, startTime, endTime, status }));
-  res.json({ success: true, data });
-});
-
-apiRouter.post('/rooms', requireAdmin, (req: Request, res: Response) => {
+apiRouter.post('/auth/register', async (request, response) => {
   try {
-    const actor = getActor(req);
-    const { name, code, capacity, description, equipmentIncluded, hourlyRate, status, imageUrl, color } = req.body;
-    
-    // Validation
-    if (!name || !code) {
-      return res.status(400).json({ success: false, error: 'กรุณากรอกชื่อห้องและรหัสห้อง' });
-    }
-    if (Number(capacity) <= 0) {
-      return res.status(400).json({ success: false, error: 'ความจุของห้องต้องมากกว่า 0 คน' });
-    }
+    const { name, studentId, password } = request.body ?? {};
+    const cleanName = typeof name === 'string' ? name.trim() : '';
+    const cleanStudentId = typeof studentId === 'string' ? studentId.trim() : '';
+    if (cleanName.length < 2 || cleanName.length > 80) throw new ApiError(400, 'กรุณากรอกชื่ออย่างน้อย 2 ตัวอักษร');
+    if (!/^\d{9}-\d$/.test(cleanStudentId)) throw new ApiError(400, 'รหัสนักศึกษาต้องอยู่ในรูปแบบ 663450351-5');
+    if (typeof password !== 'string' || password.length < 8 || password.length > 128) throw new ApiError(400, 'รหัสผ่านต้องมีความยาว 8-128 ตัวอักษร');
 
-    const room = dbStore.createRoom({
-      name,
-      code,
-      capacity: Number(capacity) || 1,
-      description: description || '',
-      equipmentIncluded: Array.isArray(equipmentIncluded) ? equipmentIncluded : [],
-      hourlyRate: Number(hourlyRate) || 0,
-      status: status || 'AVAILABLE',
-      imageUrl: imageUrl || 'https://images.unsplash.com/photo-1598488035139-bdbb2231ce04?w=800&auto=format&fit=crop&q=80',
-      color: color || 'indigo'
-    }, actor!.name);
-
-    res.status(201).json({ success: true, message: 'บันทึกห้องซ้อมใหม่สำเร็จ', data: room });
-  } catch (error: any) {
-    res.status(400).json({ success: false, error: error.message });
-  }
-});
-
-apiRouter.put('/rooms/:id', requireAdmin, (req: Request, res: Response) => {
-  try {
-    const actor = getActor(req);
-    const updated = dbStore.updateRoom(req.params.id, req.body, actor!.name);
-    res.json({ success: true, message: 'แก้ไขข้อมูลห้องซ้อมสำเร็จ', data: updated });
-  } catch (error: any) {
-    res.status(400).json({ success: false, error: error.message });
-  }
-});
-
-apiRouter.delete('/rooms/:id', requireAdmin, (req: Request, res: Response) => {
-  try {
-    const actor = getActor(req);
-    const ok = dbStore.deleteRoom(req.params.id, actor!.name);
-    if (!ok) return res.status(404).json({ success: false, error: 'ไม่พบห้องซ้อมที่ระบุ' });
-    res.json({ success: true, message: 'ลบห้องซ้อมสำเร็จ' });
-  } catch (error: any) {
-    res.status(400).json({ success: false, error: error.message });
-  }
-});
-
-// --- BOOKINGS (CRUD: GET, POST, PUT, DELETE) ---
-apiRouter.get('/bookings', (req: Request, res: Response) => {
-  const actor = getActor(req)!;
-  const { search, roomId, userId, status, date } = req.query as any;
-  const bookings = dbStore.getBookings({ search, roomId, userId: actor.role === 'ADMIN' ? userId : actor.id, status, date });
-  res.json({ success: true, count: bookings.length, data: bookings });
-});
-
-apiRouter.get('/bookings/:id', (req: Request, res: Response) => {
-  const booking = dbStore.getBookingById(req.params.id);
-  if (!booking) return res.status(404).json({ success: false, error: 'ไม่พบรายการจองนี้' });
-  const actor = getActor(req)!;
-  if (actor.role !== 'ADMIN' && booking.userId !== actor.id) return res.status(403).json({ success: false, error: 'ไม่มีสิทธิ์ดูรายการนี้' });
-  res.json({ success: true, data: booking });
-});
-
-apiRouter.post('/bookings', (req: Request, res: Response) => {
-  try {
-    const actor = getActor(req)!;
-    const { roomId, date, startTime, endTime, purpose, bandName, memberCount, phone } = req.body;
-    
-    // Server-side validation
-    if (!roomId) return res.status(400).json({ success: false, error: 'กรุณาเลือกห้องซ้อม' });
-    if (!date) return res.status(400).json({ success: false, error: 'กรุณาระบุวันที่จอง' });
-    if (!startTime || !endTime) return res.status(400).json({ success: false, error: 'กรุณาระบุเวลาเริ่มและเวลาสิ้นสุด' });
-    if (!bandName || bandName.trim().length < 2) return res.status(400).json({ success: false, error: 'กรุณาระบุชื่อวง/กลุ่ม (อย่างน้อย 2 ตัวอักษร)' });
-    if (!purpose || purpose.trim().length < 3) return res.status(400).json({ success: false, error: 'กรุณาระบุวัตถุประสงค์ในการเข้าใช้บริการ' });
-
-    const newBooking = dbStore.createBooking({
-      userId: actor.id,
-      roomId,
-      date,
-      startTime,
-      endTime,
-      purpose,
-      bandName,
-      memberCount: Number(memberCount) || 1,
-      phone: phone || ''
+    const user = await prisma.user.create({
+      data: { name: cleanName, studentId: cleanStudentId, passwordHash: hashPassword(password) },
+      select: { id: true, name: true, studentId: true, role: true, phone: true, bandName: true },
     });
-
-    res.status(201).json({ success: true, message: 'ส่งคำขอจองห้องซ้อมสำเร็จ รอดำเนินการอนุมัติ', data: newBooking });
-  } catch (error: any) {
-    res.status(400).json({ success: false, error: error.message });
-  }
+    setSessionCookie(response, user.id);
+    return response.status(201).json({ success: true, data: safeUser(user) });
+  } catch (error) { return sendError(response, error); }
 });
 
-apiRouter.put('/bookings/:id', (req: Request, res: Response) => {
+apiRouter.post('/auth/login', async (request, response) => {
   try {
-    const actor = getActor(req);
-    const current = dbStore.getBookingById(req.params.id);
-    if (!current) return res.status(404).json({ success: false, error: 'ไม่พบรายการจองนี้' });
-    let updates = req.body;
-    if (actor!.role !== 'ADMIN') {
-      if (current.userId !== actor!.id) return res.status(403).json({ success: false, error: 'ไม่มีสิทธิ์แก้ไขรายการนี้' });
-      if (current.status !== 'PENDING') return res.status(403).json({ success: false, error: 'แก้ไขได้เฉพาะคำขอที่รออนุมัติ' });
-      if ('status' in req.body || 'adminNote' in req.body) return res.status(403).json({ success: false, error: 'สมาชิกไม่สามารถเปลี่ยนสถานะหรือบันทึกหมายเหตุผู้ดูแลได้' });
-      const allowedFields = ['roomId', 'date', 'startTime', 'endTime', 'purpose', 'bandName', 'memberCount', 'phone'];
-      updates = Object.fromEntries(allowedFields.filter((field) => field in req.body).map((field) => [field, req.body[field]]));
-    }
-    const updated = dbStore.updateBooking(req.params.id, updates, actor!.name);
-    res.json({ success: true, message: 'แก้ไขข้อมูลการจองสำเร็จ', data: updated });
-  } catch (error: any) {
-    res.status(400).json({ success: false, error: error.message });
-  }
+    const { studentId, password } = request.body ?? {};
+    if (typeof studentId !== 'string' || typeof password !== 'string') throw new ApiError(400, 'กรุณากรอกรหัสนักศึกษาและรหัสผ่าน');
+    const cleanStudentId = studentId.trim();
+    if (!/^\d{9}-\d$/.test(cleanStudentId)) throw new ApiError(400, 'รหัสนักศึกษาต้องอยู่ในรูปแบบ 663450351-5');
+    const user = await prisma.user.findUnique({ where: { studentId: cleanStudentId } });
+    if (!user || !verifyPassword(password, user.passwordHash)) throw new ApiError(401, 'รหัสนักศึกษาหรือรหัสผ่านไม่ถูกต้อง');
+    setSessionCookie(response, user.id);
+    return response.json({ success: true, data: safeUser(user) });
+  } catch (error) { return sendError(response, error); }
 });
 
-apiRouter.delete('/bookings/:id', (req: Request, res: Response) => {
+const authenticate: RequestHandler = async (request, response, next) => {
   try {
-    const actor = getActor(req);
-    const booking = dbStore.getBookingById(req.params.id);
-    if (!booking) return res.status(404).json({ success: false, error: 'ไม่พบรายการจองนี้' });
-    if (actor!.role !== 'ADMIN' && (booking.userId !== actor!.id || booking.status !== 'PENDING')) {
-      return res.status(403).json({ success: false, error: 'ยกเลิกได้เฉพาะคำขอของคุณที่รออนุมัติ' });
-    }
-    const ok = dbStore.deleteBooking(req.params.id, actor!.name);
-    if (!ok) return res.status(404).json({ success: false, error: 'ไม่พบรายการจองนี้' });
-    res.json({ success: true, message: 'ยกเลิกรายการจองสำเร็จ' });
-  } catch (error: any) {
-    res.status(400).json({ success: false, error: error.message });
-  }
+    const userId = getSessionUserId(request);
+    if (!userId) throw new ApiError(401, 'กรุณาเข้าสู่ระบบ');
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, name: true, studentId: true, role: true, phone: true, bandName: true } });
+    if (!user) throw new ApiError(401, 'ไม่พบบัญชีผู้ใช้ กรุณาเข้าสู่ระบบใหม่');
+    (request as AuthedRequest).actor = safeUser(user);
+    next();
+  } catch (error) { sendError(response, error); }
+};
+
+apiRouter.use(authenticate);
+
+apiRouter.get('/auth/me', (request, response) => response.json({ success: true, data: (request as AuthedRequest).actor }));
+apiRouter.post('/auth/logout', (_request, response) => {
+  clearSessionCookie(response);
+  response.json({ success: true });
 });
 
-// --- EQUIPMENTS (CRUD: GET, POST, PUT, DELETE) ---
-apiRouter.get('/equipments', (req: Request, res: Response) => {
-  const { search, category, condition, availableOnly } = req.query as any;
-  const equipments = dbStore.getEquipments({
-    search,
-    category,
-    condition,
-    availableOnly: availableOnly === 'true'
+apiRouter.get('/rooms', async (_request, response) => {
+  try {
+    const rooms = await listRooms();
+    response.json({ success: true, count: rooms.length, data: rooms.map(mapRoom) });
+  } catch (error) { sendError(response, error); }
+});
+
+apiRouter.get('/bookings', async (request, response) => {
+  try {
+    const actor = (request as AuthedRequest).actor;
+    const { search, roomId, userId, status, date } = request.query;
+    const where: Prisma.BookingWhereInput = {};
+    if (actor.role !== 'ADMIN') where.userId = actor.id;
+    else if (typeof userId === 'string' && userId !== 'ALL') where.userId = userId;
+    if (typeof roomId === 'string' && roomId !== 'ALL') where.roomId = roomId;
+    if (typeof status === 'string' && status !== 'ALL') where.status = status as BookingStatus;
+    if (typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date)) where.date = new Date(`${date}T00:00:00.000Z`);
+    if (typeof search === 'string' && search.trim()) {
+      const query = search.trim();
+      where.OR = [
+        { bookingCode: { contains: query, mode: 'insensitive' } },
+        { bandName: { contains: query, mode: 'insensitive' } },
+        { purpose: { contains: query, mode: 'insensitive' } },
+        { user: { name: { contains: query, mode: 'insensitive' } } },
+        { user: { studentId: { contains: query, mode: 'insensitive' } } },
+        { room: { name: { contains: query, mode: 'insensitive' } } },
+      ];
+    }
+    const records = await listBookings(where, 500);
+    response.json({ success: true, count: records.length, data: records.map(mapBooking) });
+  } catch (error) { sendError(response, error); }
+});
+
+apiRouter.get('/availability', async (request, response) => {
+  try {
+    const date = typeof request.query.date === 'string' ? request.query.date : undefined;
+    const from = typeof request.query.from === 'string' ? request.query.from : date;
+    const to = typeof request.query.to === 'string' ? request.query.to : from;
+    if (!from || !to || !/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) throw new ApiError(400, 'กรุณาระบุช่วงวันที่ให้ถูกต้อง');
+    const fromDate = new Date(`${from}T00:00:00.000Z`);
+    const toDate = new Date(`${to}T00:00:00.000Z`);
+    if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime()) || toDate < fromDate || toDate.getTime() - fromDate.getTime() > 42 * 86400000) throw new ApiError(400, 'ช่วงวันที่ไม่ถูกต้อง (เลือกได้ไม่เกิน 42 วัน)');
+    const roomId = typeof request.query.roomId === 'string' ? request.query.roomId : undefined;
+    const records = await prisma.booking.findMany({
+      where: { date: { gte: fromDate, lte: toDate }, status: { in: ['PENDING', 'APPROVED', 'IN_USE'] }, ...(roomId && roomId !== 'ALL' ? { roomId } : {}) },
+      select: { roomId: true, date: true, startTime: true, endTime: true, status: true },
+      orderBy: [{ date: 'asc' }, { startTime: 'asc' }],
+    });
+    response.json({ success: true, data: records.map((booking) => ({ ...booking, date: booking.date.toISOString().slice(0, 10) })) });
+  } catch (error) { sendError(response, error); }
+});
+
+function validateBooking(input: Record<string, unknown>, roomCapacity: number, allowExistingPastDate = false) {
+  const roomId = typeof input.roomId === 'string' ? input.roomId : '';
+  const date = typeof input.date === 'string' ? input.date : '';
+  const startTime = typeof input.startTime === 'string' ? input.startTime : '';
+  const endTime = typeof input.endTime === 'string' ? input.endTime : '';
+  const bandName = typeof input.bandName === 'string' ? input.bandName.trim() : '';
+  const purpose = typeof input.purpose === 'string' ? input.purpose.trim() : '';
+  const phone = typeof input.phone === 'string' ? input.phone.trim() : '';
+  const memberCount = Number(input.memberCount);
+  if (!roomId) throw new ApiError(400, 'กรุณาเลือกห้องซ้อม');
+  const parsedDate = new Date(`${date}T00:00:00.000Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(parsedDate.getTime()) || parsedDate.toISOString().slice(0, 10) !== date) throw new ApiError(400, 'วันที่จองไม่ถูกต้อง');
+  if (!allowExistingPastDate && date < new Date().toISOString().slice(0, 10)) throw new ApiError(400, 'ไม่สามารถจองวันที่ผ่านมาแล้ว');
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(startTime) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(endTime) || startTime >= endTime) throw new ApiError(400, 'ช่วงเวลาไม่ถูกต้อง เวลาเริ่มต้องก่อนเวลาสิ้นสุด');
+  if (bandName.length < 2 || bandName.length > 80) throw new ApiError(400, 'ชื่อวง/กลุ่มต้องมีความยาว 2-80 ตัวอักษร');
+  if (purpose.length < 3 || purpose.length > 500) throw new ApiError(400, 'วัตถุประสงค์ต้องมีความยาว 3-500 ตัวอักษร');
+  if (!Number.isInteger(memberCount) || memberCount < 1 || memberCount > roomCapacity) throw new ApiError(400, `จำนวนสมาชิกต้องอยู่ระหว่าง 1-${roomCapacity} คน`);
+  if (phone && !/^[0-9+()\- ]{8,20}$/.test(phone)) throw new ApiError(400, 'รูปแบบเบอร์โทรศัพท์ไม่ถูกต้อง');
+  return { roomId, date: new Date(`${date}T00:00:00.000Z`), dateText: date, startTime, endTime, bandName, purpose, memberCount, phone };
+}
+
+async function getRoomForBooking(roomId: string) {
+  const room = await prisma.room.findUnique({ where: { id: roomId } });
+  if (!room) throw new ApiError(404, 'ไม่พบห้องซ้อมที่เลือก');
+  if (room.status !== 'AVAILABLE') throw new ApiError(400, 'ห้องนี้ปิดให้บริการชั่วคราว');
+  return room;
+}
+
+async function ensureNoConflict(tx: Prisma.TransactionClient, roomId: string, date: Date, startTime: string, endTime: string, excludeId?: string) {
+  const conflict = await tx.booking.findFirst({
+    where: { roomId, date, status: { in: ['PENDING', 'APPROVED', 'IN_USE'] }, startTime: { lt: endTime }, endTime: { gt: startTime }, ...(excludeId ? { id: { not: excludeId } } : {}) },
+    select: { id: true },
   });
-  res.json({ success: true, count: equipments.length, data: equipments });
-});
+  if (conflict) throw new ApiError(409, 'ช่วงเวลานี้มีผู้จองแล้ว กรุณาเลือกเวลาอื่น');
+}
 
-apiRouter.get('/equipments/:id', (req: Request, res: Response) => {
-  const eq = dbStore.getEquipmentById(req.params.id);
-  if (!eq) return res.status(404).json({ success: false, error: 'ไม่พบอุปกรณ์นี้' });
-  res.json({ success: true, data: eq });
-});
-
-apiRouter.post('/equipments', requireAdmin, (req: Request, res: Response) => {
+apiRouter.post('/bookings', async (request, response) => {
   try {
-    const actor = getActor(req);
-    const { name, code, category, brand, model, totalQuantity, condition, location, description, imageUrl } = req.body;
-
-    if (!name || !code || !category) {
-      return res.status(400).json({ success: false, error: 'กรุณากรอกชื่อ รหัส และหมวดหมู่อุปกรณ์' });
-    }
-    const qty = Number(totalQuantity);
-    if (isNaN(qty) || qty <= 0) {
-      return res.status(400).json({ success: false, error: 'จำนวนอุปกรณ์ต้องมากกว่า 0' });
-    }
-
-    const created = dbStore.createEquipment({
-      name,
-      code,
-      category,
-      brand: brand || '',
-      model: model || '',
-      totalQuantity: qty,
-      availableQuantity: qty,
-      condition: condition || 'GOOD',
-      location: location || 'ตู้เก็บอุปกรณ์ชมรม',
-      description: description || '',
-      imageUrl: imageUrl || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=600&auto=format&fit=crop&q=80'
-    }, actor!.name);
-
-    res.status(201).json({ success: true, message: 'เพิ่มอุปกรณ์ใหม่เข้าสู่คลังสำเร็จ', data: created });
-  } catch (error: any) {
-    res.status(400).json({ success: false, error: error.message });
-  }
+    const actor = (request as AuthedRequest).actor;
+    const input = request.body ?? {};
+    const room = await getRoomForBooking(String(input.roomId ?? ''));
+    const validated = validateBooking(input, room.capacity);
+    const booking = await prisma.$transaction(async (tx) => {
+      await ensureNoConflict(tx, room.id, validated.date, validated.startTime, validated.endTime);
+      const created = await tx.booking.create({
+        data: {
+          bookingCode: `BK-${validated.dateText.replaceAll('-', '')}-${randomUUID().slice(0, 6).toUpperCase()}`,
+          userId: actor.id,
+          roomId: room.id,
+          date: validated.date,
+          startTime: validated.startTime,
+          endTime: validated.endTime,
+          purpose: validated.purpose,
+          bandName: validated.bandName,
+          phone: validated.phone || actor.phone,
+          memberCount: validated.memberCount,
+        },
+      });
+      return tx.booking.findUniqueOrThrow({ where: { id: created.id }, include: { user: { select: { id: true, name: true, studentId: true, phone: true } }, room: { select: { id: true, code: true, name: true, capacity: true, description: true, equipmentIncluded: true, hourlyRate: true, status: true, imageUrl: true, color: true } } } });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    response.status(201).json({ success: true, data: mapBooking(booking) });
+  } catch (error) { sendError(response, error); }
 });
 
-apiRouter.put('/equipments/:id', requireAdmin, (req: Request, res: Response) => {
+apiRouter.put('/bookings/:id', async (request, response) => {
   try {
-    const actor = getActor(req);
-    const updated = dbStore.updateEquipment(req.params.id, req.body, actor!.name);
-    res.json({ success: true, message: 'แก้ไขข้อมูลอุปกรณ์สำเร็จ', data: updated });
-  } catch (error: any) {
-    res.status(400).json({ success: false, error: error.message });
-  }
+    const actor = (request as unknown as AuthedRequest).actor;
+    const current = await prisma.booking.findUnique({ where: { id: request.params.id }, include: { room: true } });
+    if (!current) throw new ApiError(404, 'ไม่พบรายการจองนี้');
+    if (actor.role !== 'ADMIN' && (current.userId !== actor.id || current.status !== 'PENDING')) throw new ApiError(403, 'แก้ไขได้เฉพาะคำขอของคุณที่รออนุมัติ');
+
+    const updates = request.body ?? {};
+    if (actor.role !== 'ADMIN' && ('status' in updates || 'adminNote' in updates)) throw new ApiError(403, 'ไม่มีสิทธิ์เปลี่ยนสถานะการจอง');
+    const roomId = typeof updates.roomId === 'string' ? updates.roomId : current.roomId;
+    const targetRoom = await getRoomForBooking(roomId);
+    const validated = validateBooking({
+      roomId,
+      date: typeof updates.date === 'string' ? updates.date : current.date.toISOString().slice(0, 10),
+      startTime: updates.startTime ?? current.startTime,
+      endTime: updates.endTime ?? current.endTime,
+      bandName: updates.bandName ?? current.bandName,
+      purpose: updates.purpose ?? current.purpose,
+      memberCount: updates.memberCount ?? current.memberCount,
+      phone: updates.phone ?? current.phone,
+    }, targetRoom.capacity, (typeof updates.date !== 'string' || updates.date === current.date.toISOString().slice(0, 10)));
+    const allowedStatuses: BookingStatus[] = ['PENDING', 'APPROVED', 'REJECTED', 'IN_USE', 'COMPLETED', 'CANCELLED'];
+    const status = actor.role === 'ADMIN' && allowedStatuses.includes(updates.status) ? updates.status as BookingStatus : current.status;
+    const updated = await prisma.$transaction(async (tx) => {
+      if (['PENDING', 'APPROVED', 'IN_USE'].includes(status)) await ensureNoConflict(tx, roomId, validated.date, validated.startTime, validated.endTime, current.id);
+      const record = await tx.booking.update({
+        where: { id: current.id },
+        data: {
+          roomId,
+          date: validated.date,
+          startTime: validated.startTime,
+          endTime: validated.endTime,
+          bandName: validated.bandName,
+          purpose: validated.purpose,
+          memberCount: validated.memberCount,
+          phone: validated.phone,
+          status,
+          ...(actor.role === 'ADMIN' && typeof updates.adminNote === 'string' ? { adminNote: updates.adminNote.slice(0, 500) } : {}),
+        },
+      });
+      return tx.booking.findUniqueOrThrow({ where: { id: record.id }, include: { user: { select: { id: true, name: true, studentId: true, phone: true } }, room: { select: { id: true, code: true, name: true, capacity: true, description: true, equipmentIncluded: true, hourlyRate: true, status: true, imageUrl: true, color: true } } } });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    response.json({ success: true, data: mapBooking(updated) });
+  } catch (error) { sendError(response, error); }
 });
 
-apiRouter.delete('/equipments/:id', requireAdmin, (req: Request, res: Response) => {
+apiRouter.delete('/bookings/:id', async (request, response) => {
   try {
-    const actor = getActor(req);
-    const ok = dbStore.deleteEquipment(req.params.id, actor!.name);
-    if (!ok) return res.status(404).json({ success: false, error: 'ไม่พบอุปกรณ์ที่ระบุ' });
-    res.json({ success: true, message: 'ลบอุปกรณ์สำเร็จ' });
-  } catch (error: any) {
-    res.status(400).json({ success: false, error: error.message });
-  }
-});
-
-// --- BORROWINGS (CRUD: GET, POST, PUT, DELETE) ---
-apiRouter.get('/borrowings', (req: Request, res: Response) => {
-  const actor = getActor(req)!;
-  const { search, userId, equipmentId, status } = req.query as any;
-  const borrowings = dbStore.getBorrowings({ search, userId: actor.role === 'ADMIN' ? userId : actor.id, equipmentId, status });
-  res.json({ success: true, count: borrowings.length, data: borrowings });
-});
-
-apiRouter.get('/borrowings/:id', (req: Request, res: Response) => {
-  const borrowing = dbStore.getBorrowingById(req.params.id);
-  if (!borrowing) return res.status(404).json({ success: false, error: 'ไม่พบรายการยืมนี้' });
-  const actor = getActor(req)!;
-  if (actor.role !== 'ADMIN' && borrowing.userId !== actor.id) return res.status(403).json({ success: false, error: 'ไม่มีสิทธิ์ดูรายการนี้' });
-  res.json({ success: true, data: borrowing });
-});
-
-apiRouter.post('/borrowings', (req: Request, res: Response) => {
-  try {
-    const actor = getActor(req)!;
-    const { equipmentId, quantity, borrowDate, expectedReturnDate, purpose, phone } = req.body;
-
-    if (!equipmentId) return res.status(400).json({ success: false, error: 'กรุณาเลือกอุปกรณ์ที่ต้องการยืม' });
-    if (!borrowDate || !expectedReturnDate) return res.status(400).json({ success: false, error: 'กรุณาระบุวันที่ยืมและกำหนดส่งคืน' });
-    if (!purpose || purpose.trim().length < 3) return res.status(400).json({ success: false, error: 'กรุณาระบุวัตถุประสงค์ในการยืมอุปกรณ์' });
-
-    const newBorrowing = dbStore.createBorrowing({
-      userId: actor.id,
-      equipmentId,
-      quantity: Number(quantity) || 1,
-      borrowDate,
-      expectedReturnDate,
-      purpose,
-      phone: phone || ''
-    });
-
-    res.status(201).json({ success: true, message: 'ส่งคำขอยืมอุปกรณ์สำเร็จ รอผู้ดูแลอนุมัติ', data: newBorrowing });
-  } catch (error: any) {
-    res.status(400).json({ success: false, error: error.message });
-  }
-});
-
-apiRouter.put('/borrowings/:id', requireAdmin, (req: Request, res: Response) => {
-  try {
-    const actor = getActor(req);
-    const updated = dbStore.updateBorrowing(req.params.id, req.body, actor!.name);
-    res.json({ success: true, message: 'อัปเดตรายการยืมสำเร็จ', data: updated });
-  } catch (error: any) {
-    res.status(400).json({ success: false, error: error.message });
-  }
-});
-
-apiRouter.delete('/borrowings/:id', (req: Request, res: Response) => {
-  try {
-    const actor = getActor(req);
-    const borrowing = dbStore.getBorrowingById(req.params.id);
-    if (!borrowing) return res.status(404).json({ success: false, error: 'ไม่พบรายการยืมนี้' });
-    if (actor!.role !== 'ADMIN' && (borrowing.userId !== actor!.id || borrowing.status !== 'REQUESTED')) {
-      return res.status(403).json({ success: false, error: 'ยกเลิกได้เฉพาะคำขอยืมของคุณที่รออนุมัติ' });
-    }
-    const ok = dbStore.deleteBorrowing(req.params.id, actor!.name);
-    if (!ok) return res.status(404).json({ success: false, error: 'ไม่พบรายการยืมนี้' });
-    res.json({ success: true, message: 'ยกเลิกรายการยืมสำเร็จ' });
-  } catch (error: any) {
-    res.status(400).json({ success: false, error: error.message });
-  }
+    const actor = (request as unknown as AuthedRequest).actor;
+    const booking = await prisma.booking.findUnique({ where: { id: request.params.id } });
+    if (!booking) throw new ApiError(404, 'ไม่พบรายการจองนี้');
+    if (actor.role !== 'ADMIN' && (booking.userId !== actor.id || booking.status !== 'PENDING')) throw new ApiError(403, 'ยกเลิกได้เฉพาะคำขอของคุณที่รออนุมัติ');
+    await prisma.booking.delete({ where: { id: booking.id } });
+    response.json({ success: true });
+  } catch (error) { sendError(response, error); }
 });
